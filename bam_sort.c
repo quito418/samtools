@@ -3048,7 +3048,7 @@ typedef struct {
     htsThreadPool* htspool;
     template_coordinate_keys_t *keys;
     sam_hdr_t *header;
-    samFile *fp;
+    samFile **fp;
     SamOrder* sam_order;
 
 } worker_pipe_t;
@@ -3066,6 +3066,7 @@ static void *worker_pipeline_read(worker_pipe_t *data){
         pthread_cond_wait(&cond_read_start, &mut_pipe_read); //wait for the condition
     }
     pipe_read_empty=false;
+    // fprintf(stderr,"Thread %d start Reading\n", data->thread_id);
     pthread_mutex_unlock(&mut_pipe_read);
 
     data->return_status = 0;
@@ -3074,9 +3075,14 @@ static void *worker_pipeline_read(worker_pipe_t *data){
 
     size_t bam_mem_offset=0;
     data->k =0;
-    
+    // fprintf(stderr,"Thread %d \n", data->thread_id);
 
-    while ((res = sam_read1(data->fp, data->header, data->b)) >= 0) {
+    if (*data->fp == NULL){
+        // sam_read1 hangs sometime...
+        return;
+    }
+
+    while ((res = sam_read1( (*data->fp), data->header, data->b)) >= 0) {
         // youngmok: set num_in_mem 0 here to avoid setting it to 0 when sam_read fails
         data->num_in_mem = 0;
         data->mem_full = 0;
@@ -3151,6 +3157,12 @@ static void *worker_pipeline_read(worker_pipe_t *data){
         ++(data->k);
     }
 
+    if (data->mem_full != 1){
+        if (*data->fp) sam_close(*data->fp);
+        *data->fp = NULL;
+
+    }
+
     // youngmok: check if memory is full or input has ended
     if (data->k > 0) {
         // youngmok: use thread which may be smaller than n_threads, but sort is fast enough...
@@ -3172,6 +3184,7 @@ static void *worker_pipeline_read(worker_pipe_t *data){
 
     pthread_mutex_lock(&mut_pipe_read);
     pipe_read_empty=true;
+    // fprintf(stderr,"Thread %d Done Reading\n", data->thread_id);
     pthread_cond_signal(&cond_read_start);
     pthread_mutex_unlock(&mut_pipe_read);
 
@@ -3216,6 +3229,7 @@ static void *worker_pipeline_write(worker_pipe_t *data){
     const int MAX_TRIES = 1000;
     int tries = 0, merge_res = -1;
     char *sort_by_tag = (g_sam_order == TagQueryName || g_sam_order == TagCoordinate) ? data->sort_tag : NULL;
+
     int consolidate_from = *data->n_files;
     if ( *(data->n_files) - *(data->n_big_files) >= MAX_TMP_FILES/2)
         consolidate_from = *data->n_big_files;
@@ -3287,6 +3301,7 @@ static void *worker_pipeline_write(worker_pipe_t *data){
 
     pthread_mutex_lock(&mut_pipe_write);
     pipe_write_empty=true;
+    
     pthread_cond_signal(&cond_pipe_write_start);
     pthread_mutex_unlock(&mut_pipe_write);
 
@@ -3316,8 +3331,10 @@ static void *pipeline(void *data)
         if ( w_d->return_status == -1){
             break;
         }
+        // fprintf(stderr,"tid:%d running here\n", w_d->thread_id);
         if (w_d->mem_full && w_d->k > 0){
             worker_pipeline_write(w_d);
+            // fprintf(stderr,"tid:%d after writing\n", w_d->thread_id);
         }
         else{// exit pipeline!, phase 1 is done.
             break;
@@ -3585,7 +3602,7 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
         wr->htspool = &htspool;
         wr->keys = keys;
         wr->header = header;
-        wr->fp = fp;
+        wr->fp = &fp;
         wr->sam_order = &sam_order;
 
     }
@@ -3781,7 +3798,7 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
     }
     #endif
     
-
+    fprintf(stderr, "output!\n");
     // write the final output
     if (n_files == 0 && num_in_mem < 2) { // a single block
         if (write_buffer(fnout, modeout, k, buf, header, n_threads, out_fmt,
@@ -3838,7 +3855,7 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
     free(in_mem);
     lib_lookup_destroy(lib_lookup);
     sam_hdr_destroy(header);
-    if (fp) sam_close(fp);
+    // if (fp) sam_close(fp);
     if (htspool.pool)
         hts_tpool_destroy(htspool.pool);
 
