@@ -3798,7 +3798,6 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
     }
     #endif
     
-    fprintf(stderr, "output!\n");
     // write the final output
     if (n_files == 0 && num_in_mem < 2) { // a single block
         if (write_buffer(fnout, modeout, k, buf, header, n_threads, out_fmt,
