@@ -3015,6 +3015,7 @@ typedef struct {
     
     uint8_t *bam_mem;
     buf_region *in_mem;
+    int thread;
 
     size_t max_k;
     size_t   max_mem; //bam_mem_offset
@@ -3070,9 +3071,11 @@ static void *worker_pipeline_read(worker_pipe_t *data){
 
     size_t bam_mem_offset=0;
     data->k =0;
-    data->num_in_mem = 0;
+    
 
     while ((res = sam_read1(data->fp, data->header, data->b)) >= 0) {
+        // youngmok: set num_in_mem 0 here to avoid setting it to 0 when sam_read fails
+        data->num_in_mem = 0;
         data->mem_full = 0;
         if (data->k == data->max_k) {
             bam1_tag *new_buf;
@@ -3135,7 +3138,8 @@ static void *worker_pipeline_read(worker_pipe_t *data){
 
     // youngmok: check if memory is full or input has ended
     if (data->k > 0) {
-        data->num_in_mem  = sort_blocks(data->k, data->buf, data->header, data->n_threads,
+        // youngmok: use thread which may be smaller than n_threads, but sort is fast enough...
+        data->num_in_mem  = sort_blocks(data->k, data->buf, data->header, data->thread,
                                     data->in_mem, data->large_pos, data->minimiser_kmer);
         if (data->num_in_mem  < 0){
             print_error("sort", "sort_blocks function failed");
@@ -3237,9 +3241,9 @@ static void *worker_pipeline_write(worker_pipe_t *data){
     }
 
     (*(data->n_files))++;
-    data->k = 0;
+    // data->k = 0; // reset in read pipeline
     if (data->keys != NULL) data->keys->n = 0;
-    // bam_mem_offset = 0; // reset in read pipelie
+    // bam_mem_offset = 0; // reset in read pipeline
 
 
 
@@ -3276,9 +3280,6 @@ static void *pipeline(void *data)
         }
         if (w_d->mem_full && w_d->k > 0){
             worker_pipeline_write(w_d);
-            if ( w_d->return_status == -1){
-                break;
-            }
         }
         else{// exit pipeline!, phase 1 is done.
             break;
@@ -3489,7 +3490,7 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
         hts_set_opt(fp, HTS_OPT_THREAD_POOL, &htspool);
     }
 
-    if ((bam_mem = malloc(max_mem)) == NULL) {
+    if ((bam_mem = malloc(max_mem+1)) == NULL) {
         print_error("sort", "couldn't allocate memory for bam_mem");
         goto err;
     }
@@ -3505,17 +3506,28 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
 
     #if USE_PIPELINE
     //youngmok: prepare required datas
-    int num_pipe = 1;
+    int num_pipe = 2; // only supports 1 or 2
     worker_pipe_t* workers = (worker_pipe_t*) malloc(num_pipe * sizeof(worker_pipe_t));
 
-
+    int thread, rest_threads=n_threads;
+    size_t pipe_max_mem, rest_max_mem=max_mem; 
     for (int i = 0; i < num_pipe; ++i) {
         worker_pipe_t *wr = &workers[i];
         
-        wr->bam_mem = bam_mem;
-        wr->in_mem = in_mem;
-        wr->max_mem = max_mem;
+        thread =  rest_threads / (num_pipe - i);
+        rest_threads -=  thread;
+
+        pipe_max_mem = rest_max_mem / (num_pipe - i); 
+        rest_max_mem -= pipe_max_mem;
+
+
+        // wr->max_mem = max_mem;
+        wr->max_mem = pipe_max_mem;
+        // pipeline shares bam_mem, divided by region
+        wr->bam_mem = bam_mem + (max_mem - rest_max_mem - pipe_max_mem) + i;
+        wr->in_mem = in_mem + (n_threads - rest_threads - thread);
         wr->n_threads = n_threads;
+        wr->thread = thread; // thread for dividing buf, in_mem, max_memory for bam_mem
 
         wr->max_k = 0;
         wr->minimiser_kmer = minimiser_kmer;
@@ -3562,10 +3574,11 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
     // fns = workers[0].fns;
     // in_mem = workers[0].in_mem;
 
-    num_in_mem = workers[0].num_in_mem;
-    k = workers[0].k;
-    buf = workers[0].buf;
-
+    worker_pipe_t* final_w = ( (num_pipe==1) || (workers[0].mem_full ==0)) ? workers : workers+1;
+    num_in_mem = final_w->num_in_mem; // number of block in-memory
+    k = final_w->k; // number of reads
+    buf = final_w->buf; // buf storing bam data
+    in_mem = final_w->in_mem;
 
     #else // original code, not using pipeline
 
