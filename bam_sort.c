@@ -3514,11 +3514,11 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
         
         wr->bam_mem = bam_mem;
         wr->in_mem = in_mem;
+        wr->max_mem = max_mem;
+        wr->n_threads = n_threads;
 
         wr->max_k = 0;
-        wr->max_mem = max_mem;
         wr->minimiser_kmer = minimiser_kmer;
-        wr->n_threads = n_threads;
         wr->large_pos = large_pos;
         wr->b = bam_init1();
         wr->buf = NULL;
@@ -3549,10 +3549,20 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
     for (int i = 0; i < num_pipe; ++i)
         pthread_join(ptid[i], 0);
 
+
+    for (int i = 0; i < num_pipe; ++i){
+        worker_pipe_t *wr = &workers[i];
+        if (wr->return_status == -1)
+        {
+            fprintf(stderr,"Error during pipelined Sorting\n");
+            goto err;
+        }
+    }
     // n_files = workers[0].n_files; // n_files is updated by threads
-    fns = workers[0].fns;
-    num_in_mem = workers[0].num_in_mem;
+    // fns = workers[0].fns;
     // in_mem = workers[0].in_mem;
+
+    num_in_mem = workers[0].num_in_mem;
     k = workers[0].k;
     buf = workers[0].buf;
 
