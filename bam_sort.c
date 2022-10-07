@@ -57,6 +57,10 @@ DEALINGS IN THE SOFTWARE.  */
 #define BAM_BLOCK_SIZE 2*1024*1024
 #define MAX_TMP_FILES 64
 
+#define DEBUG_PHASE2 false
+#define DEBUG_PHASE1 false
+#define USE_PIPELINE true
+
 // Struct which contains the sorting key for TemplateCoordinate sort.
 typedef struct {
     int tid1;
@@ -1774,6 +1778,296 @@ static inline int heap_add_read(heap1_t *heap, int nfiles, samFile **fp,
     return 0;
 }
 
+pthread_t merge_tid[2];
+pthread_mutex_t mut_write_start, mut_write_end;
+pthread_cond_t cond_write_end;
+pthread_cond_t cond_write_start;
+bool write_ready = false;
+bool write_done = true;
+
+typedef struct {
+    const char *cmd;
+    const char *out;
+    sam_hdr_t *hout;
+    bam1_t** b;
+    samFile *fpout;
+
+} worker_merge_t;
+
+
+static void *worker_write(void *data){
+    
+    worker_merge_t *w = (worker_merge_t*)data;
+    while (1){
+        pthread_mutex_lock(&mut_write_start);
+        while(!write_ready){
+            pthread_cond_wait(&cond_write_start, &mut_write_start); //wait for the condition
+        }
+        write_ready=false;
+        pthread_mutex_unlock(&mut_write_start);
+
+        if (sam_write1(w->fpout, w->hout, *(w->b) ) < 0) {
+            print_error_errno(w->cmd, "failed writing to \"%s\"", w->out);
+            // goto fail;
+            // return res code to make it go to fail
+            return -1;
+        }
+
+        pthread_mutex_lock(&mut_write_end);
+        write_done=true;
+        pthread_cond_signal(&cond_write_end);
+        pthread_mutex_unlock(&mut_write_end);
+    }
+
+}
+
+static int bam_merge_simple_mt(SamOrder sam_order, char *sort_tag, const char *out,
+                            const char *mode, sam_hdr_t *hout,
+                            int n, char * const *fn, int num_in_mem,
+                            buf_region *in_mem, bam1_tag *buf,
+                            template_coordinate_keys_t *keys,
+                            khash_t(const_c2c) *lib_lookup,
+                            htsThreadPool *htspool,
+                            const char *cmd, const htsFormat *in_fmt,
+                            const htsFormat *out_fmt, char *arg_list, int no_pg,
+                            int write_index) {
+    samFile *fpout = NULL, **fp = NULL;
+    heap1_t *heap = NULL;
+    uint64_t idx = 0;
+    int i, heap_size = n + num_in_mem;
+    char *out_idx_fn = NULL;
+
+    if (sam_order == TagQueryName || sam_order == TagCoordinate) {
+        g_sort_tag[0] = sort_tag[0];
+        g_sort_tag[1] = sort_tag[0] ? sort_tag[1] : '\0';
+    }
+    if (n > 0) {
+        fp = (samFile**)calloc(n, sizeof(samFile*));
+        if (!fp) goto mem_fail;
+    }
+    heap = (heap1_t*)calloc(heap_size, sizeof(heap1_t));
+    if (!heap) goto mem_fail;
+
+    // Make sure that there's enough memory for template coordinate keys, one per file to read
+    if (keys && keys->n + n >= keys->m * keys->buffer_size) {
+        if (template_coordinate_keys_realloc(keys, keys->n + n) < 0) goto mem_fail;
+    }
+
+    // Open each file, read the header and put the first read into the heap
+    for (i = 0; i < heap_size; i++) {
+        sam_hdr_t *hin;
+        heap1_t *h = &heap[i];
+
+        if (i < n) {
+            fp[i] = sam_open_format(fn[i], "r", in_fmt);
+            if (fp[i] == NULL) {
+                print_error_errno(cmd, "fail to open \"%s\"", fn[i]);
+                goto fail;
+            }
+            hts_set_opt(fp[i], HTS_OPT_BLOCK_SIZE, BAM_BLOCK_SIZE);
+            if (htspool->pool)
+                hts_set_opt(fp[i], HTS_OPT_THREAD_POOL, htspool);
+
+            // Read header ...
+            hin = sam_hdr_read(fp[i]);
+            if (hin == NULL) {
+                print_error(cmd, "failed to read header from \"%s\"", fn[i]);
+                goto fail;
+            }
+            // ... and throw it away as we don't really need it
+            sam_hdr_destroy(hin);
+        }
+
+        // Get a read into the heap
+        h->i = i;
+        h->entry.u.tag = NULL;
+        h->entry.u.key = NULL;
+        if (i < n) {
+            h->entry.bam_record = bam_init1();
+            if (!h->entry.bam_record) goto mem_fail;
+        }
+        if (heap_add_read(h, n, fp, num_in_mem, in_mem, buf, keys, &idx, hout,
+                          lib_lookup) < 0) {
+            assert(i < n);
+            print_error(cmd, "failed to read first record from \"%s\"", fn[i]);
+            goto fail;
+        }
+    }
+
+    // Open output file and write header
+    if ((fpout = sam_open_format(out, mode, out_fmt)) == 0) {
+        print_error_errno(cmd, "failed to create \"%s\"", out);
+        return -1;
+    }
+    hts_set_opt(fpout, HTS_OPT_BLOCK_SIZE, BAM_BLOCK_SIZE);
+
+    if (!no_pg && sam_hdr_add_pg(hout, "samtools",
+                                 "VN", samtools_version(),
+                                 arg_list ? "CL": NULL,
+                                 arg_list ? arg_list : NULL,
+                                 NULL)) {
+        print_error(cmd, "failed to add PG line to the header of \"%s\"", out);
+        sam_close(fpout);
+        return -1;
+    }
+
+    if (htspool->pool)
+        hts_set_opt(fpout, HTS_OPT_THREAD_POOL, htspool);
+
+    if (sam_hdr_write(fpout, hout) != 0) {
+        print_error_errno(cmd, "failed to write header to \"%s\"", out);
+        sam_close(fpout);
+        return -1;
+    }
+
+    if (write_index) {
+        if (!(out_idx_fn = auto_index(fpout, out, hout))){
+            sam_close(fpout);
+            return -1;
+        }
+    }
+
+    #if DEBUG_PHASE2    
+    clock_t start, end;
+    double time_taken_write=0, time_taken_heap=0, time_taken_heapjust=0;
+    #endif
+    /* 
+        youngmok: create writer thread and reader thread
+        1. swap the first element of heap and tmp_bam
+        2. run two threads
+        Writer thread: gets signal, write the tmp bam to file, notice the main thread it is done
+        Reader thread: gets signal, read the file into heap bam, notice the main thread
+        3. heapadjust
+
+        * maybe combine 3 into reader thread.
+        * when new one is read, it is deterministic second one or the new one should be read
+        * mostly the second one should be... what about doing prefetch style read.
+    */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+    
+    // youngmok: space to save spare bam
+    bam1_t* tmp_bam = bam_init1();
+    bam1_t* tmp_swap;
+
+    worker_merge_t w[2];
+
+    w[0].cmd = cmd;
+    w[0].out = out;
+    w[0].hout = hout;
+    w[0].b = &tmp_bam;
+    w[0].fpout = fpout;
+
+    pthread_create(&merge_tid[0], &attr, worker_write, &w[0]);
+
+    // Now do the merge
+    ks_heapmake(heap, heap_size, heap);
+    while (heap->pos != HEAP_EMPTY) {
+        bam1_t *b = heap->entry.bam_record;
+        if (g_sam_order == MinHash && b->core.tid == -1) {
+            // Remove the cached minhash value
+            b->core.pos = -1;
+            b->core.mpos = -1;
+            b->core.isize = 0;
+        }
+        #if DEBUG_PHASE2
+        start = clock();
+        #endif
+
+        // youngmok: check writer thread has finished
+        pthread_mutex_lock(&mut_write_end);
+        while (!write_done){
+            pthread_cond_wait(&cond_write_end, &mut_write_end);
+        }
+        write_done=false;
+        pthread_mutex_unlock(&mut_write_end);
+
+        // if (sam_write1(fpout, hout, b) < 0) {
+        //     print_error_errno(cmd, "failed writing to \"%s\"", out);
+        //     goto fail;
+        // }
+
+        // youngmok: swap heap and tmp_bam
+        // tmp_swap = tmp_bam;
+        // tmp_bam = heap->entry.bam_record;
+        // heap->entry.bam_record = tmp_swap;
+        bam_copy1(tmp_bam, heap->entry.bam_record);
+        // youngmok: signal writer thread to start writing tmp_bam
+        pthread_mutex_lock(&mut_write_start);
+        write_ready=true;
+        pthread_cond_signal(&cond_write_start);
+        pthread_mutex_unlock(&mut_write_start);
+
+        #if DEBUG_PHASE2
+        time_taken_write += clock() - start;
+        start = clock();
+        #endif
+        if (heap_add_read(heap, n, fp, num_in_mem, in_mem, buf, keys, &idx,
+                          hout, lib_lookup) < 0) {
+            assert(heap->i < n);
+            print_error(cmd, "Error reading \"%s\" : %s",
+                        fn[heap->i], strerror(errno));
+            goto fail;
+        }
+        #if DEBUG_PHASE2
+        time_taken_heap += clock() - start;
+        start = clock();
+        #endif
+        ks_heapadjust(heap, 0, heap_size, heap);
+        #if DEBUG_PHASE2
+        time_taken_heapjust += clock() - start;
+        #endif
+    }
+    #if DEBUG_PHASE2
+    fprintf(stderr,"Took %f ms to write, Took %f ms to read, Took %f ms to adjust \n", time_taken_write/CLOCKS_PER_SEC , time_taken_heap/CLOCKS_PER_SEC , time_taken_heapjust/CLOCKS_PER_SEC );
+    #endif
+    // Clean up and close
+    for (i = 0; i < n; i++) {
+        if (sam_close(fp[i]) != 0) {
+            print_error(cmd, "Error on closing \"%s\" : %s",
+                        fn[i], strerror(errno));
+        }
+    }
+    free(fp);
+    free(heap);
+
+    if (write_index) {
+        if (sam_idx_save(fpout) < 0) {
+            print_error_errno("merge", "writing index failed");
+            goto fail;
+        }
+        free(out_idx_fn);
+    }
+
+    if (sam_close(fpout) < 0) {
+        print_error(cmd, "error closing output file");
+        return -1;
+    }
+    return 0;
+ mem_fail:
+    print_error(cmd, "Out of memory");
+
+ fail:
+    for (i = 0; i < n; i++) {
+        if (fp && fp[i]) sam_close(fp[i]);
+    }
+    for (i = 0; i < heap_size; i++) {
+        if (heap && heap[i].i < n && heap[i].entry.bam_record)
+            bam_destroy1(heap[i].entry.bam_record);
+    }
+    free(fp);
+    free(heap);
+    if (fpout) sam_close(fpout);
+    free(out_idx_fn);
+    return -1;
+}
+
+
+
+
+
+
 static int bam_merge_simple(SamOrder sam_order, char *sort_tag, const char *out,
                             const char *mode, sam_hdr_t *hout,
                             int n, char * const *fn, int num_in_mem,
@@ -1880,6 +2174,10 @@ static int bam_merge_simple(SamOrder sam_order, char *sort_tag, const char *out,
         }
     }
 
+    #if DEBUG_PHASE2
+    clock_t start, end;
+    double time_taken_write=0, time_taken_heap=0, time_taken_heapjust=0;
+    #endif
     // Now do the merge
     ks_heapmake(heap, heap_size, heap);
     while (heap->pos != HEAP_EMPTY) {
@@ -1890,10 +2188,17 @@ static int bam_merge_simple(SamOrder sam_order, char *sort_tag, const char *out,
             b->core.mpos = -1;
             b->core.isize = 0;
         }
+        #if DEBUG_PHASE2
+        start = clock();
+        #endif
         if (sam_write1(fpout, hout, b) < 0) {
             print_error_errno(cmd, "failed writing to \"%s\"", out);
             goto fail;
         }
+        #if DEBUG_PHASE2
+        time_taken_write += clock() - start;
+        start = clock();
+        #endif
         if (heap_add_read(heap, n, fp, num_in_mem, in_mem, buf, keys, &idx,
                           hout, lib_lookup) < 0) {
             assert(heap->i < n);
@@ -1901,8 +2206,18 @@ static int bam_merge_simple(SamOrder sam_order, char *sort_tag, const char *out,
                         fn[heap->i], strerror(errno));
             goto fail;
         }
+        #if DEBUG_PHASE2
+        time_taken_heap += clock() - start;
+        start = clock();
+        #endif
         ks_heapadjust(heap, 0, heap_size, heap);
+        #if DEBUG_PHASE2
+        time_taken_heapjust += clock() - start;
+        #endif
     }
+    #if DEBUG_PHASE2
+    fprintf(stderr,"Took %f ms to write, Took %f ms to read, Took %f ms to adjust \n", time_taken_write/CLOCKS_PER_SEC , time_taken_heap/CLOCKS_PER_SEC , time_taken_heapjust/CLOCKS_PER_SEC );
+    #endif
     // Clean up and close
     for (i = 0; i < n; i++) {
         if (sam_close(fp[i]) != 0) {
@@ -2694,6 +3009,287 @@ static khash_t(const_c2c) * lookup_libraries(sam_hdr_t *header)
     return NULL;
 }
 
+
+typedef struct {
+    // Not shared between pipelines
+    size_t   max_mem; //bam_mem_offset
+    
+    bam1_tag *buf;
+    uint8_t *bam_mem;
+    buf_region *in_mem;
+    int minimiser_kmer;
+    int n_threads;
+    int large_pos;
+    bam1_t *b; // used for reading in read
+
+    // no need initialize
+    int mem_full;
+    int num_in_mem; 
+    size_t k;
+    int return_status;
+
+    // youngmok: shared between pipelines
+    // changing values
+    int* n_files,  *n_big_files, *fn_counter;
+    char **fns;
+    size_t* fns_size;
+
+    // not changing values
+    size_t name_len;
+    const char *prefix;
+    char* sort_tag;
+    khash_t(const_c2c) *lib_lookup;
+    htsThreadPool* htspool;
+    template_coordinate_keys_t *keys;
+    sam_hdr_t *header;
+    samFile *fp;
+    SamOrder* sam_order;
+
+} worker_pipe_t;
+
+
+pthread_mutex_t mut_pipe_read;
+pthread_cond_t cond_read_start;
+bool pipe_read_empty = true;
+
+static void *worker_pipeline_read(worker_pipe_t *data){
+    
+
+    pthread_mutex_lock(&mut_pipe_read);
+    while(!pipe_read_empty){
+        pthread_cond_wait(&cond_read_start, &mut_pipe_read); //wait for the condition
+    }
+    pipe_read_empty=false;
+    pthread_mutex_unlock(&mut_pipe_read);
+
+    data->return_status = 0;
+
+    int res;
+
+    size_t bam_mem_offset=0;
+    data->k =0;
+    data->num_in_mem = 0;
+    size_t max_k = 0;
+
+    while ((res = sam_read1(data->fp, data->header, data->b)) >= 0) {
+        data->mem_full = 0;
+        if (data->k == max_k) {
+            bam1_tag *new_buf;
+            max_k = max_k? max_k<<1 : 0x10000;
+            if ((new_buf = realloc(data->buf, max_k * sizeof(bam1_tag))) == NULL) {
+                print_error("sort", "couldn't allocate memory for buf");
+                // youngmok: lets return result in data, and check if something goes wrong.
+                // goto err;
+                data->return_status = -1;
+                return;
+            }
+            data->buf = new_buf;
+        }
+        if (*(data->sam_order) == TemplateCoordinate && data->k >= data->keys->m * data->keys->buffer_size) {
+            if (template_coordinate_keys_realloc(data->keys, data->k + 1) == -1) {
+                // goto err;
+                data->return_status = -1;
+                return;
+            }
+        }
+
+        // Check if the BAM record will fit in the memory limit
+        if (bam_mem_offset + sizeof(*data->b) + data->b->l_data < data->max_mem) {
+            // Copy record into the memory block
+            data->buf[data->k].bam_record = (bam1_t *)(data->bam_mem + bam_mem_offset);
+            *data->buf[data->k].bam_record = *data->b;
+            data->buf[data->k].bam_record->data = (uint8_t *)((char *)data->buf[data->k].bam_record + sizeof(bam1_t));
+            memcpy(data->buf[data->k].bam_record->data, data->b->data, data->b->l_data);
+            // store next BAM record in next 8-byte-aligned address after
+            // current one
+            bam_mem_offset = (bam_mem_offset + sizeof(*data->b) + data->b->l_data + 8 - 1) & ~((size_t)(8 - 1));
+        } else {
+            // Add a pointer to the remaining record
+            data->buf[data->k].bam_record = data->b;
+            data->mem_full = 1;
+            break;
+        }
+
+        // Set the tag if sorting by tag, or the key for template cooridinate sorting
+        switch (g_sam_order) {
+            case TagQueryName:
+            case TagCoordinate:
+                data->buf[data->k].u.tag = bam_aux_get(data->buf[data->k].bam_record, g_sort_tag);
+                break;
+            case TemplateCoordinate:
+                ++data->keys->n;
+                template_coordinate_key_t *key = template_coordinate_keys_get(data->keys, data->k);
+                data->buf[data->k].u.key = template_coordinate_key(data->buf[data->k].bam_record, key, data->header, data->lib_lookup);
+                if (data->buf[data->k].u.key == NULL) {
+                    data->return_status = -1;//goto err;
+                    return;
+                }
+                break;
+            default:
+                data->buf[data->k].u.tag = NULL;
+                data->buf[data->k].u.key = NULL;
+        }
+        ++data->k;
+    }
+
+    // youngmok: check if memory is full or input has ended
+    if (data->k > 0) {
+        data->num_in_mem  = sort_blocks(data->k, data->buf, data->header, data->n_threads,
+                                    data->in_mem, data->large_pos, data->minimiser_kmer);
+        if (data->num_in_mem  < 0){
+            print_error("sort", "sort_blocks function failed");
+            data->return_status = -1;
+            return;
+        }
+    } else{
+        data->num_in_mem = 0;
+    }
+    
+
+    pthread_mutex_lock(&mut_pipe_read);
+    pipe_read_empty=true;
+    pthread_cond_signal(&cond_read_start);
+    pthread_mutex_unlock(&mut_pipe_read);
+
+}
+
+
+pthread_mutex_t mut_pipe_write;
+pthread_cond_t cond_pipe_write_start;
+bool pipe_write_empty = true;
+
+static void *worker_pipeline_write(worker_pipe_t *data){
+    
+    pthread_mutex_lock(&mut_pipe_write);
+    while(!pipe_write_empty){
+        pthread_cond_wait(&cond_pipe_write_start, &mut_pipe_write); //wait for the condition
+    }
+    pipe_write_empty=false;
+    pthread_mutex_unlock(&mut_pipe_write);
+
+    data->return_status = 0;
+
+    int i;
+    if (hts_resize(char *, *data->n_files + 1, &data->fns_size, &data->fns, 0) < 0){
+
+    }
+        data->fns[*data->n_files] = calloc(data->name_len, 1);
+        if (!data->fns[*data->n_files]){
+            // goto err;
+            data->return_status=-1;
+            return -1;
+        }
+            
+        const int MAX_TRIES = 1000;
+        int tries = 0, merge_res = -1;
+        char *sort_by_tag = (g_sam_order == TagQueryName || g_sam_order == TagCoordinate) ? data->sort_tag : NULL;
+        int consolidate_from = *data->n_files;
+        if (*data->n_files - *data->n_big_files >= MAX_TMP_FILES/2)
+            consolidate_from = *data->n_big_files;
+        else if (*data->n_files >= MAX_TMP_FILES)
+            consolidate_from = 0;
+
+        for (;;) {
+            if (tries) {
+                snprintf(data->fns[*data->n_files], data->name_len, "%s.%.4d-%.3d.bam",
+                            data->prefix, *data->fn_counter, tries);
+            } else {
+                snprintf(data->fns[*data->n_files], data->name_len, "%s.%.4d.bam", data->prefix,
+                            *data->fn_counter);
+            }
+            if (bam_merge_simple(g_sam_order, sort_by_tag, data->fns[*data->n_files],
+                                    data->large_pos ? "wzx1" : "wbx1", data->header,
+                                    *data->n_files - consolidate_from,
+                                    &data->fns[consolidate_from], data->n_threads,
+                                    data->in_mem, data->buf, data->keys,
+                                    data->lib_lookup, data->htspool, "sort", NULL, NULL,
+                                    NULL, 1, 0) >= 0) {
+                merge_res = 0;
+                break;
+            }
+            if (errno == EEXIST && tries < MAX_TRIES) {
+                tries++;
+            } else {
+                break;
+            }
+        }
+        *data->fn_counter++;
+        if (merge_res < 0) {
+            if (errno != EEXIST)
+                unlink(data->fns[*data->n_files]);
+            free(data->fns[*data->n_files]);
+            // goto err;
+            data->return_status=-1;
+            return;
+        }
+
+        if (consolidate_from < *data->n_files) {
+            for (i = consolidate_from; i < *data->n_files; i++) {
+                unlink(data->fns[i]);
+                free(data->fns[i]);
+            }
+            data->fns[consolidate_from] = data->fns[*data->n_files];
+            *data->n_files = consolidate_from;
+            *data->n_big_files = consolidate_from + 1;
+        }
+
+        *data->n_files++;
+        data->k = 0;
+        if (data->keys != NULL) data->keys->n = 0;
+        // bam_mem_offset = 0; // reset in read pipelie
+
+
+
+    pthread_mutex_lock(&mut_pipe_write);
+    pipe_write_empty=true;
+    pthread_cond_signal(&cond_pipe_write_start);
+    pthread_mutex_unlock(&mut_pipe_write);
+
+}
+
+static void *pipeline(void *data)
+{
+    /*
+        youngmok: 
+        - Run read or write one thread at anytime.
+        - Put sort in read
+        - each thread should share reader and writer data
+        - each thread should have different buf 
+
+
+        Read,Sort block
+        1. fill in buffer until memory full.
+        2. Sort
+    */
+    worker_pipe_t* w_d = (worker_pipe_t*) data;
+
+    w_d->return_status = 0;
+
+    while( w_d->return_status == 0){
+
+        worker_pipeline_read(w_d);
+        if ( w_d->return_status == -1){
+            break;
+        }
+        if (w_d->mem_full){
+            worker_pipeline_write(w_d);
+            if ( w_d->return_status == -1){
+                break;
+            }
+        }
+        else{// exit pipeline!, phase 1 is done.
+            break;
+        }
+        
+        
+    }
+
+
+
+}
+
+
+
 /*!
   @abstract Sort an unsorted BAM file based on the provided sort order
 
@@ -2901,6 +3497,41 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
     // write sub files
     k = max_k = bam_mem_offset = 0;
     size_t name_len = strlen(prefix) + 30;
+
+
+
+    #if USE_PIPELINE
+    //youngmok: prepare required datas
+    int num_pipe = 1;
+    worker_pipe_t* workers = (worker_pipe_t*) malloc(num_pipe * sizeof(worker_pipe_t));
+    for (int i = 0; i < num_pipe; ++i) {
+        worker_pipe_t *wr = &workers[i];
+        wr->max_mem = max_mem;
+
+        wr->minimiser_kmer = minimiser_kmer;
+        wr->n_threads = n_threads;
+        wr->large_pos = large_pos;
+        wr->b = bam_init1();
+
+        wr->n_files = &n_files;
+        wr->n_big_files = &n_big_files;
+        wr->fn_counter = &fn_counter;
+        wr->fns= fns;
+        wr->fns_size = &fns_size;
+
+    }
+
+
+
+
+    #else
+
+    #if DEBUG_PHASE1
+    clock_t start, end;
+    double time_taken_write=0, time_taken_heap=0, time_taken_heapjust=0;
+    start = clock();
+    #endif
+
     while ((res = sam_read1(fp, header, b)) >= 0) {
         int mem_full = 0;
 
@@ -2954,14 +3585,26 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
         ++k;
 
         if (mem_full) {
-            if (hts_resize(char *, n_files + 1, &fns_size, &fns, 0) < 0)
-                goto err;
-
+            
+            #if DEBUG_PHASE1
+            time_taken_write += clock()-start;
+            start = clock();
+            #endif
             int sort_res = sort_blocks(k, buf, header, n_threads,
                                        in_mem, large_pos, minimiser_kmer);
+            // youngmok: in_mem keeps the position in buf where each bin starts.
+
+            #if DEBUG_PHASE1
+            time_taken_heap += clock()-start;
+            start = clock();
+            #endif
+
             if (sort_res < 0)
                 goto err;
 
+
+            if (hts_resize(char *, n_files + 1, &fns_size, &fns, 0) < 0)
+                goto err;
             fns[n_files] = calloc(name_len, 1);
             if (!fns[n_files])
                 goto err;
@@ -3020,9 +3663,21 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
             k = 0;
             if (keys != NULL) keys->n = 0;
             bam_mem_offset = 0;
-
+            #if DEBUG_PHASE1
+            time_taken_heapjust += clock()-start;
+            start = clock();
+            #endif
         }
     }
+    #if DEBUG_PHASE1
+    fprintf(stderr,"Took %f ms to read, Took %f ms to sort, Took %f ms to write \n", time_taken_write/CLOCKS_PER_SEC , time_taken_heap/CLOCKS_PER_SEC , time_taken_heapjust/CLOCKS_PER_SEC );
+    #endif
+
+    #endif
+
+
+    
+
     if (res != -1) {
         print_error("sort", "truncated file. Aborting");
         goto err;
