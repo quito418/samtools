@@ -3132,7 +3132,7 @@ static void *worker_pipeline_read(worker_pipe_t *data){
                 data->buf[data->k].u.tag = bam_aux_get(data->buf[data->k].bam_record, g_sort_tag);
                 break;
             case TemplateCoordinate:
-                ++data->keys->n;
+                ++(data->keys->n);
                 template_coordinate_key_t *key = template_coordinate_keys_get(data->keys, data->k);
                 data->buf[data->k].u.key = template_coordinate_key(data->buf[data->k].bam_record, key, data->header, data->lib_lookup);
                 if (data->buf[data->k].u.key == NULL) {
@@ -3233,13 +3233,6 @@ static void *worker_pipeline_write(worker_pipe_t *data){
         }
 
         // fprintf(stderr, "tid:%d file:%s try:%d, fn_counter:%d nfiles:%d consolidate_from:%d \n", data->thread_id, (*data->fns)[*data->n_files], tries, *data->fn_counter, *data->n_files, consolidate_from);
-
-        if (*data->n_files==20 && data->thread_id ==0 ){
-            for (int jj=0; jj< *data->n_files; jj++){
-                fprintf(stderr," jj:%d file:%s\n", jj, (*data->fns)[jj]);        
-            }
-
-        }
 
         if (bam_merge_simple(g_sam_order, sort_by_tag, (*data->fns)[*data->n_files],
                                 data->large_pos ? "wzx1" : "wbx1", data->header,
@@ -3476,7 +3469,6 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
             new_so = "unknown";
             break;
     }
-
     if (new_ss == NULL && new_go == NULL) { // just SO
         if ((-1 == sam_hdr_update_hd(header, "SO", new_so))
             && (-1 == sam_hdr_add_line(header, "HD", "VN", SAM_FORMAT_VERSION, "SO", new_so, NULL))
@@ -3809,7 +3801,6 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
                 abort();
             }
         }
-        fprintf(stderr, "reaching here\n");
         char *sort_by_tag = (sam_order == TagQueryName || sam_order == TagCoordinate) ? sort_tag : NULL;
         if (bam_merge_simple(sam_order, sort_by_tag, fnout, modeout, header,
                              n_files, fns, num_in_mem, in_mem, buf, keys,
@@ -3819,7 +3810,6 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
             // message explaining the failure, so no further message is needed.
             goto err;
         }
-        fprintf(stderr, "reaching here\n");
     }
 
     ret = 0;
