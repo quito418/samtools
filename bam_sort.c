@@ -3130,7 +3130,7 @@ static void *worker_pipeline_read(worker_pipe_t *data){
                 data->buf[data->k].u.tag = NULL;
                 data->buf[data->k].u.key = NULL;
         }
-        ++data->k;
+        ++(data->k);
     }
 
     // youngmok: check if memory is full or input has ended
@@ -3192,12 +3192,13 @@ static void *worker_pipeline_write(worker_pipe_t *data){
         consolidate_from = 0;
 
     for (;;) {
+        // fprintf(stderr, "try:%d, fn_counter:%d nfiles:%d \n", tries, *data->fn_counter, *data->n_files);
         if (tries) {
             snprintf(data->fns[*data->n_files], data->name_len, "%s.%.4d-%.3d.bam",
-                        data->prefix, *data->fn_counter, tries);
+                        data->prefix, *(data->fn_counter), tries);
         } else {
             snprintf(data->fns[*data->n_files], data->name_len, "%s.%.4d.bam", data->prefix,
-                        *data->fn_counter);
+                        *(data->fn_counter));
         }
         if (bam_merge_simple(g_sam_order, sort_by_tag, data->fns[*data->n_files],
                                 data->large_pos ? "wzx1" : "wbx1", data->header,
@@ -3215,7 +3216,7 @@ static void *worker_pipeline_write(worker_pipe_t *data){
             break;
         }
     }
-    *data->fn_counter++;
+    (*(data->fn_counter))++;
     if (merge_res < 0) {
         if (errno != EEXIST)
             unlink(data->fns[*data->n_files]);
@@ -3235,7 +3236,7 @@ static void *worker_pipeline_write(worker_pipe_t *data){
         *data->n_big_files = consolidate_from + 1;
     }
 
-    *data->n_files++;
+    (*(data->n_files))++;
     data->k = 0;
     if (data->keys != NULL) data->keys->n = 0;
     // bam_mem_offset = 0; // reset in read pipelie
@@ -3525,7 +3526,7 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
         wr->n_files = &n_files;
         wr->n_big_files = &n_big_files;
         wr->fn_counter = &fn_counter;
-        wr->fns= fns;
+        wr->fns = fns;
         wr->fns_size = &fns_size;
         wr->name_len = name_len;
         wr->prefix = prefix;
