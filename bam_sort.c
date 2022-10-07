@@ -2106,6 +2106,7 @@ static int bam_merge_simple(SamOrder sam_order, char *sort_tag, const char *out,
         heap1_t *h = &heap[i];
 
         if (i < n) {
+            // fprintf(stderr,"i:%d filename: %s\n",i, fn[i]);
             fp[i] = sam_open_format(fn[i], "r", in_fmt);
             if (fp[i] == NULL) {
                 print_error_errno(cmd, "fail to open \"%s\"", fn[i]);
@@ -3016,6 +3017,8 @@ typedef struct {
     uint8_t *bam_mem;
     buf_region *in_mem;
     int thread;
+    int thread_id;
+
 
     size_t max_k;
     size_t   max_mem; //bam_mem_offset
@@ -3034,7 +3037,7 @@ typedef struct {
     // youngmok: shared between pipelines
     // changing values
     int* n_files,  *n_big_files, *fn_counter;
-    char **fns;
+    char ***fns;
     size_t* fns_size;
 
     // not changing values
@@ -3085,6 +3088,10 @@ static void *worker_pipeline_read(worker_pipe_t *data){
                 // youngmok: lets return result in data, and check if something goes wrong.
                 // goto err;
                 data->return_status = -1;
+                pthread_mutex_lock(&mut_pipe_read);
+                pipe_read_empty=true;
+                pthread_cond_signal(&cond_read_start);
+                pthread_mutex_unlock(&mut_pipe_read);
                 return;
             }
             data->buf = new_buf;
@@ -3093,6 +3100,10 @@ static void *worker_pipeline_read(worker_pipe_t *data){
             if (template_coordinate_keys_realloc(data->keys, data->k + 1) == -1) {
                 // goto err;
                 data->return_status = -1;
+                pthread_mutex_lock(&mut_pipe_read);
+                pipe_read_empty=true;
+                pthread_cond_signal(&cond_read_start);
+                pthread_mutex_unlock(&mut_pipe_read);
                 return;
             }
         }
@@ -3126,6 +3137,10 @@ static void *worker_pipeline_read(worker_pipe_t *data){
                 data->buf[data->k].u.key = template_coordinate_key(data->buf[data->k].bam_record, key, data->header, data->lib_lookup);
                 if (data->buf[data->k].u.key == NULL) {
                     data->return_status = -1;//goto err;
+                    pthread_mutex_lock(&mut_pipe_read);
+                    pipe_read_empty=true;
+                    pthread_cond_signal(&cond_read_start);
+                    pthread_mutex_unlock(&mut_pipe_read);
                     return;
                 }
                 break;
@@ -3144,6 +3159,10 @@ static void *worker_pipeline_read(worker_pipe_t *data){
         if (data->num_in_mem  < 0){
             print_error("sort", "sort_blocks function failed");
             data->return_status = -1;
+            pthread_mutex_lock(&mut_pipe_read);
+            pipe_read_empty=true;
+            pthread_cond_signal(&cond_read_start);
+            pthread_mutex_unlock(&mut_pipe_read);
             return;
         }
     } else{
@@ -3175,14 +3194,22 @@ static void *worker_pipeline_write(worker_pipe_t *data){
     data->return_status = 0;
 
     int i;
-    if (hts_resize(char *, *data->n_files + 1, data->fns_size, &(data->fns), 0) < 0){
+    if (hts_resize(char *, *data->n_files + 1, data->fns_size, data->fns, 0) < 0){
         data->return_status=-1;
+        pthread_mutex_lock(&mut_pipe_write);
+        pipe_write_empty=true;
+        pthread_cond_signal(&cond_pipe_write_start);
+        pthread_mutex_unlock(&mut_pipe_write);
         return;
     }
-    data->fns[*data->n_files] = calloc(data->name_len, 1);
-    if (!data->fns[*data->n_files]){
+    (*data->fns)[*data->n_files] = calloc(data->name_len, 1);
+    if (!(*data->fns)[*data->n_files]){
         // goto err;
         data->return_status=-1;
+        pthread_mutex_lock(&mut_pipe_write);
+        pipe_write_empty=true;
+        pthread_cond_signal(&cond_pipe_write_start);
+        pthread_mutex_unlock(&mut_pipe_write);
         return;
     }
         
@@ -3190,24 +3217,34 @@ static void *worker_pipeline_write(worker_pipe_t *data){
     int tries = 0, merge_res = -1;
     char *sort_by_tag = (g_sam_order == TagQueryName || g_sam_order == TagCoordinate) ? data->sort_tag : NULL;
     int consolidate_from = *data->n_files;
-    if (*data->n_files - *data->n_big_files >= MAX_TMP_FILES/2)
+    if ( *(data->n_files) - *(data->n_big_files) >= MAX_TMP_FILES/2)
         consolidate_from = *data->n_big_files;
     else if (*data->n_files >= MAX_TMP_FILES)
         consolidate_from = 0;
 
     for (;;) {
-        // fprintf(stderr, "try:%d, fn_counter:%d nfiles:%d \n", tries, *data->fn_counter, *data->n_files);
+        
         if (tries) {
-            snprintf(data->fns[*data->n_files], data->name_len, "%s.%.4d-%.3d.bam",
+            snprintf((*data->fns)[*data->n_files], data->name_len, "%s.%.4d-%.3d.bam",
                         data->prefix, *(data->fn_counter), tries);
         } else {
-            snprintf(data->fns[*data->n_files], data->name_len, "%s.%.4d.bam", data->prefix,
+            snprintf((*data->fns)[*data->n_files], data->name_len, "%s.%.4d.bam", data->prefix,
                         *(data->fn_counter));
         }
-        if (bam_merge_simple(g_sam_order, sort_by_tag, data->fns[*data->n_files],
+
+        // fprintf(stderr, "tid:%d file:%s try:%d, fn_counter:%d nfiles:%d consolidate_from:%d \n", data->thread_id, (*data->fns)[*data->n_files], tries, *data->fn_counter, *data->n_files, consolidate_from);
+
+        if (*data->n_files==20 && data->thread_id ==0 ){
+            for (int jj=0; jj< *data->n_files; jj++){
+                fprintf(stderr," jj:%d file:%s\n", jj, (*data->fns)[jj]);        
+            }
+
+        }
+
+        if (bam_merge_simple(g_sam_order, sort_by_tag, (*data->fns)[*data->n_files],
                                 data->large_pos ? "wzx1" : "wbx1", data->header,
-                                *data->n_files - consolidate_from,
-                                &data->fns[consolidate_from], data->n_threads,
+                                (*(data->n_files)) - consolidate_from,
+                                &((*data->fns)[consolidate_from]), data->thread,
                                 data->in_mem, data->buf, data->keys,
                                 data->lib_lookup, data->htspool, "sort", NULL, NULL,
                                 NULL, 1, 0) >= 0) {
@@ -3220,22 +3257,30 @@ static void *worker_pipeline_write(worker_pipe_t *data){
             break;
         }
     }
+
     (*(data->fn_counter))++;
+
     if (merge_res < 0) {
+
+        fprintf(stderr,"bam_merge_simple failed\n");
         if (errno != EEXIST)
-            unlink(data->fns[*data->n_files]);
-        free(data->fns[*data->n_files]);
+            unlink((*data->fns)[*data->n_files]);
+        free((*data->fns)[*data->n_files]);
         // goto err;
         data->return_status=-1;
+        pthread_mutex_lock(&mut_pipe_write);
+        pipe_write_empty=true;
+        pthread_cond_signal(&cond_pipe_write_start);
+        pthread_mutex_unlock(&mut_pipe_write);
         return;
     }
 
     if (consolidate_from < *data->n_files) {
         for (i = consolidate_from; i < *data->n_files; i++) {
-            unlink(data->fns[i]);
-            free(data->fns[i]);
+            unlink((*data->fns)[i]);
+            free((*data->fns)[i]);
         }
-        data->fns[consolidate_from] = data->fns[*data->n_files];
+        (*data->fns)[consolidate_from] = (*data->fns)[*data->n_files];
         *data->n_files = consolidate_from;
         *data->n_big_files = consolidate_from + 1;
     }
@@ -3528,6 +3573,7 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
         wr->in_mem = in_mem + (n_threads - rest_threads - thread);
         wr->n_threads = n_threads;
         wr->thread = thread; // thread for dividing buf, in_mem, max_memory for bam_mem
+        wr->thread_id = i;
 
         wr->max_k = 0;
         wr->minimiser_kmer = minimiser_kmer;
@@ -3538,7 +3584,7 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
         wr->n_files = &n_files;
         wr->n_big_files = &n_big_files;
         wr->fn_counter = &fn_counter;
-        wr->fns = fns;
+        wr->fns = &fns;
         wr->fns_size = &fns_size;
         wr->name_len = name_len;
         wr->prefix = prefix;
@@ -3763,6 +3809,7 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
                 abort();
             }
         }
+        fprintf(stderr, "reaching here\n");
         char *sort_by_tag = (sam_order == TagQueryName || sam_order == TagCoordinate) ? sort_tag : NULL;
         if (bam_merge_simple(sam_order, sort_by_tag, fnout, modeout, header,
                              n_files, fns, num_in_mem, in_mem, buf, keys,
@@ -3772,6 +3819,7 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
             // message explaining the failure, so no further message is needed.
             goto err;
         }
+        fprintf(stderr, "reaching here\n");
     }
 
     ret = 0;
