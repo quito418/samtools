@@ -3843,7 +3843,16 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
         free(fns);
     }
     bam_destroy1(b);
+    #if USE_PIPELINE
+    free(workers[0].buf);
+    free(bam_mem);
+    free(workers[0].in_mem);
+
+    #else
     free(buf);
+    free(bam_mem);
+    free(in_mem);
+    #endif
     if (keys != NULL) {
         for (i = 0; i < keys->m; ++i) {
             free(keys->buffers[i]);
@@ -3851,8 +3860,7 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
         free(keys->buffers);
         free(keys);
     }
-    free(bam_mem);
-    free(in_mem);
+    
     lib_lookup_destroy(lib_lookup);
     sam_hdr_destroy(header);
     // if (fp) sam_close(fp);
