@@ -3824,6 +3824,7 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
                              arg_list, no_pg, write_index) < 0) {
             // Propagate bam_merge_simple() failure; it has already emitted a
             // message explaining the failure, so no further message is needed.
+            print_error("sort","Failed at merging tmp files to final output file\n");
             goto err;
         }
     }
