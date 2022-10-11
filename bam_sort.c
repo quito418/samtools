@@ -3844,10 +3844,15 @@ int bam_sort_core_ext(SamOrder sam_order, char* sort_tag, int minimiser_kmer,
     }
     bam_destroy1(b);
     #if USE_PIPELINE
-    free(workers[0].buf);
+    for (int i = 0; i < num_pipe; ++i) {
+        worker_pipe_t *wr = &workers[i];
+        free(wr->buf);
+        bam_destroy1(wr->b);
+    }
     free(bam_mem);
     free(workers[0].in_mem);
-
+    free(workers);
+    free(ptid);
     #else
     free(buf);
     free(bam_mem);
